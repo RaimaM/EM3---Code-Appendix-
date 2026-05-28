@@ -1,0 +1,206 @@
+---
+title: 'EM3: behavioural analysis'
+author: "Safira Nielsen"
+date: "2026-05-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Behavioural data processing
+
+```{r}
+setwd("C:/Users/Safir/OneDrive/KU/04Semester/EM3/Exp/EM3_Experiment_pschyopy/data")
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+```
+
+### Loading the data
+
+```{r}
+beha <- read_csv("mouse_tracking_deb01.csv")
+```
+
+## Stimulus passed and stop stimulus
+
+```{r}
+target_x <- 350
+target_y <- 0
+
+#These are the stimulus positions
+stim_levels <- c(633, 525, 371, 220, 40)
+```
+
+### Calculating the euclidean distance
+
+```{r}
+df <- beha %>%
+  mutate(
+    dist_to_target = sqrt((x - target_x)^2 + (y - target_y)^2)
+  )
+#df now contains the numerical pixel distance to target for each row.
+```
+
+### Creating a data frame for epoching
+
+```{r}
+trial_summary <- df %>%
+  group_by(ID, trial, phase) %>%
+  summarise(
+    phase      = first(phase),   # keep trial type
+    start_dist = first(dist_to_target),
+    min_dist   = min(dist_to_target),
+    end_dist   = last(dist_to_target),
+    stimuli_passed = list(
+      stim_levels[
+        start_dist > stim_levels &   # started outside
+        min_dist<= stim_levels    # ended inside at some point
+      ]
+    ),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    phase = factor(phase, levels = c("training", "transition", "test"))
+  ) %>%
+  arrange(ID, phase, trial)%>%
+  mutate(
+    stimuli_passed = purrr::map2(stimuli_passed, phase, \(x, phase) {
+      map <- switch(
+        phase,
+        training    = c("633"="40","525"="41","371"="42","220"="43","40"="44"),
+        transition  = c("633"="50","525"="51","371"="52","220"="53","40"="54"),
+        testing       = c("633"="60","525"="61","371"="62","220"="63","40"="64")
+      )
+      as.integer(unname(map[as.character(x)]))
+    }),
+    last_stimulus = purrr::map_int(stimuli_passed, ~ .x[length(.x)]),
+    stimuli_passed = sapply(stimuli_passed, paste, collapse = ";"),
+    phase = factor(phase, levels = c("training", "transition", "test"))
+  ) 
+
+#This data frame is exported to use for epoching.
+write.csv(trial_summary_extra, "end_pos.csv")
+```
+
+## Behavioural analysis
+
+```{r}
+#converting to mm
+trial_summary <- trial_summary %>% 
+  mutate(
+    grand_trial_no = row_number(),
+    end_dist_mm = end_dist / 2.108
+  )
+```
+
+### Distance to goal
+
+```{r}
+trial_summary %>% 
+  group_by(phase) %>%
+  summarise(
+    mean_distance_mm = mean(end_dist_mm, na.rm = TRUE),
+    sd_distance_mm = sd(end_dist_mm, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+### Behavioural plot, Fig. 4:
+
+```{r}
+trial_summary %>%
+  ggplot(mapping = aes(y = end_dist_mm, x = grand_trial_no))+
+  geom_point(aes(colour = phase)) +
+  geom_vline(xintercept = c(50, 90), linetype = "dotted", size = 0.8) + 
+  labs(
+    #title = "Distance to goal for all phases",
+    x = "Trial number",
+    y = "Distance to goal (mm)",
+    color = "Phase"
+  ) +
+  scale_x_continuous(breaks = c(1,20,40,60,80,100,120), limits = c(1,120), expand = c(0.008, 0.008))+
+  theme_minimal()+
+  theme(panel.border = element_rect(color = "black",
+                                    fill = NA,
+                                    size = 0.9),
+        legend.position = c(.90, .82),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "darkgrey"))+
+  scale_color_manual(
+    name = "Phase",
+    values = c(
+      "training" = "deepskyblue4",
+      "transition" = "darkorange",
+      "test" = "forestgreen"
+    ),
+    labels = c(
+      "training" = "Training",
+      "transition" = "Transition",
+      "test" = "Test"
+    )
+  )
+```
+
+## Correct/incorrect
+
+```{r}
+trial_summary <- trial_summary %>% 
+  mutate(
+    correct = if_else(end_dist < 40, "correct", "incorrect")
+  )
+
+trial_summary %>% 
+  group_by(phase) %>% 
+  summarise(
+    total_trials = n(),
+    total_correct = sum(correct == "correct", na.rm = TRUE),
+    percentage_correct = total_correct/total_trials
+  )
+```
+
+## Speed
+
+The speed calculation has to take the initial lag into acount from when the participant hears the beep and to when they start moving. The moment, by moment speed is then calculated. It is not possible to simply take the moving an last moving points, because there are varying start positions, therefore mm/s are calculated.
+
+```{r}
+trial_speeds_mm <- beha %>%
+  group_by(ID, phase, block, trial) %>%
+  arrange(time, .by_group = TRUE) %>%
+  #Each step for 60Hz
+  mutate(
+    dt = time - lag(time),            # Time difference between rows (seconds)
+    dx = x - lag(x),
+    dy = y - lag(y),
+    step_dist_px = sqrt(dx^2 + dy^2), # Distance in pixels
+    
+    #to mm
+    step_dist_mm = step_dist_px / 2.108,   # Convert step to mm
+    inst_speed_mm_s = step_dist_mm / dt    # Speed for this step in mm/s
+  ) %>%
+  #filter out the static delay
+  filter(inst_speed_mm_s > 5.0) %>% 
+  #average speed per trial
+  summarise(
+    avg_speed_mm_s = mean(inst_speed_mm_s, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    phase = factor(phase, levels = c("training", "transition", "test"))
+  )
+
+trial_speeds_mm %>% 
+  group_by(phase) %>%
+  summarise(
+    mean_speed_mm_s = mean(avg_speed_mm_s, na.rm = TRUE),
+    sd_speed_mm_s = sd(avg_speed_mm_s, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
